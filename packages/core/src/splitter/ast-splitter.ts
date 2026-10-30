@@ -277,7 +277,7 @@ export class AstCodeSplitter implements Splitter {
             });
         }
 
-        return chunks;
+        return this.fillUncoveredRanges(chunks, code, language, filePath);
     }
 
     private findRegexChunkStarts(lines: string[], language: string): Array<{ lineIndex: number; nodeType: string }> {
@@ -521,7 +521,40 @@ export class AstCodeSplitter implements Splitter {
             });
         }
 
-        return chunks;
+        return this.fillUncoveredRanges(chunks, code, language, filePath);
+    }
+
+    private fillUncoveredRanges(chunks: CodeChunk[], code: string, language: string, filePath?: string): CodeChunk[] {
+        const lines = code.split('\n');
+        const sortedChunks = [...chunks].sort((left, right) => left.metadata.startLine - right.metadata.startLine);
+        const gaps: CodeChunk[] = [];
+        const addGap = (startLine: number, endLine: number): void => {
+            while (startLine <= endLine && lines[startLine - 1].trim().length === 0) startLine++;
+            while (endLine >= startLine && lines[endLine - 1].trim().length === 0) endLine--;
+            if (startLine > endLine) return;
+
+            gaps.push({
+                content: lines.slice(startLine - 1, endLine).join('\n'),
+                metadata: {
+                    startLine,
+                    endLine,
+                    language,
+                    filePath,
+                    chunkKind: 'code',
+                    chunkRole: 'reference',
+                    isDefinition: false,
+                }
+            });
+        };
+
+        let nextLine = 1;
+        for (const chunk of sortedChunks) {
+            addGap(nextLine, chunk.metadata.startLine - 1);
+            nextLine = Math.max(nextLine, chunk.metadata.endLine + 1);
+        }
+        addGap(nextLine, lines.length);
+
+        return [...sortedChunks, ...gaps].sort((left, right) => left.metadata.startLine - right.metadata.startLine);
     }
 
     private async refineChunks(chunks: CodeChunk[]): Promise<CodeChunk[]> {

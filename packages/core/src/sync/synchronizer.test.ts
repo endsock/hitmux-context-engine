@@ -1,4 +1,5 @@
 import * as fs from 'fs/promises';
+import * as nodeFs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { FileSynchronizer, SnapshotTooLargeError } from './synchronizer';
@@ -6,6 +7,7 @@ import { FileSynchronizer, SnapshotTooLargeError } from './synchronizer';
 describe('FileSynchronizer snapshot safety', () => {
     let tempRoot: string;
     let originalHome: string | undefined;
+    let originalUserProfile: string | undefined;
     let homeDir: string;
 
     beforeEach(async () => {
@@ -14,6 +16,8 @@ describe('FileSynchronizer snapshot safety', () => {
         await fs.mkdir(homeDir, { recursive: true });
         originalHome = process.env.HOME;
         process.env.HOME = homeDir;
+        originalUserProfile = process.env.USERPROFILE;
+        process.env.USERPROFILE = homeDir;
     });
 
     afterEach(async () => {
@@ -21,6 +25,11 @@ describe('FileSynchronizer snapshot safety', () => {
             delete process.env.HOME;
         } else {
             process.env.HOME = originalHome;
+        }
+        if (originalUserProfile === undefined) {
+            delete process.env.USERPROFILE;
+        } else {
+            process.env.USERPROFILE = originalUserProfile;
         }
         await fs.rm(tempRoot, { recursive: true, force: true });
     });
@@ -107,5 +116,65 @@ describe('FileSynchronizer snapshot safety', () => {
         expect(fileHashes.has('root.ts')).toBe(true);
         expect(fileHashes.has(path.join('src', 'child.ts'))).toBe(true);
         expect(fileHashes.has(path.join('src', 'nested', 'deep.ts'))).toBe(false);
+    });
+
+    it.each(['readdir', 'stat', 'readFile'] as const)('does not treat %s failures as removed files', async (operation) => {
+        const project = path.join(tempRoot, 'project-scan-failure');
+        await fs.mkdir(project);
+        const filePath = path.join(project, 'index.ts');
+        await fs.writeFile(filePath, 'const value = 1;');
+        const synchronizer = new FileSynchronizer(project, [], ['.ts']);
+        await synchronizer.initialize();
+        await fs.writeFile(filePath, 'const changedValue = 200;');
+
+        const failure = jest.spyOn(nodeFs.promises, operation).mockRejectedValueOnce(new Error('access denied'));
+        try {
+            await expect(synchronizer.checkForChanges({ deferSnapshotUpdate: true })).rejects.toThrow('access denied');
+        } finally {
+            failure.mockRestore();
+        }
+        await synchronizer.commitPendingChanges();
+        const restarted = new FileSynchronizer(project, [], ['.ts']);
+        await restarted.initialize();
+        await expect(restarted.checkChangedPaths(['index.ts'], { deferSnapshotUpdate: true })).resolves.toEqual({
+            added: [],
+            removed: [],
+            modified: ['index.ts'],
+        });
+    });
+
+    it('preserves the previous snapshot and pending changes when atomic replacement fails', async () => {
+        const project = path.join(tempRoot, 'project-atomic-snapshot');
+        const snapshotBaseDir = path.join(tempRoot, 'atomic-snapshots');
+        await fs.mkdir(project);
+        await fs.writeFile(path.join(project, 'index.ts'), 'const value = 1;');
+        const synchronizer = new FileSynchronizer(project, [], ['.ts'], { snapshotBaseDir });
+        await synchronizer.initialize();
+        const [snapshotName] = await fs.readdir(snapshotBaseDir);
+        const snapshotPath = path.join(snapshotBaseDir, snapshotName);
+        const previousSnapshot = await fs.readFile(snapshotPath, 'utf-8');
+        const previousHash = synchronizer.getFileHash('index.ts');
+        await fs.writeFile(path.join(project, 'index.ts'), 'const value = 200;');
+        await synchronizer.checkChangedPaths(['index.ts'], { deferSnapshotUpdate: true });
+
+        const rename = jest.spyOn(nodeFs.promises, 'rename').mockRejectedValueOnce(new Error('rename failed'));
+        try {
+            await expect(synchronizer.commitPendingChanges()).rejects.toThrow('rename failed');
+            expect(synchronizer.getFileHash('index.ts')).toBe(previousHash);
+            expect(await fs.readFile(snapshotPath, 'utf-8')).toBe(previousSnapshot);
+            expect(await fs.readdir(snapshotBaseDir)).toEqual([snapshotName]);
+        } finally {
+            rename.mockRestore();
+        }
+
+        await synchronizer.commitPendingChanges();
+        expect(synchronizer.getFileHash('index.ts')).not.toBe(previousHash);
+        const restarted = new FileSynchronizer(project, [], ['.ts'], { snapshotBaseDir });
+        await restarted.initialize();
+        await expect(restarted.checkChangedPaths(['index.ts'])).resolves.toEqual({
+            added: [],
+            removed: [],
+            modified: [],
+        });
     });
 });

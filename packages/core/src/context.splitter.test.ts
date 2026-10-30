@@ -339,12 +339,11 @@ describe('Context request-scoped splitters', () => {
         expect(splitter.calls[0].code).not.toContain('raw cell should not appear');
     });
 
-    it('skips invalid Jupyter notebooks instead of indexing raw JSON text', async () => {
+    it('rejects invalid Jupyter notebooks instead of reporting a successful partial index', async () => {
         const project = path.join(tempRoot, 'project-invalid-notebook');
         await fs.mkdir(project);
         await fs.writeFile(path.join(project, 'broken.ipynb'), '{invalid json');
 
-        const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
         const vectorDatabase = createVectorDatabase();
         const splitter = new RecordingSplitter('context');
         const context = new Context({
@@ -354,14 +353,9 @@ describe('Context request-scoped splitters', () => {
             codeSplitter: splitter,
         });
 
-        try {
-            await context.indexCodebase(project);
-            expect(splitter.calls).toHaveLength(0);
-            expect(vectorDatabase.insert).not.toHaveBeenCalled();
-            expect(warn).toHaveBeenCalledWith(expect.stringContaining('Skipping file'));
-        } finally {
-            warn.mockRestore();
-        }
+        await expect(context.indexCodebase(project)).rejects.toThrow("Failed to index file 'broken.ipynb'");
+        expect(splitter.calls).toHaveLength(0);
+        expect(vectorDatabase.insert).not.toHaveBeenCalled();
     });
 
     it('deduplicates exact normalized duplicate chunks from the same file before embedding', async () => {

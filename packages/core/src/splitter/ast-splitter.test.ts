@@ -534,3 +534,93 @@ describe('AstCodeSplitter cross-language definition metadata', () => {
         expect(apiChunk?.metadata.startLine).toBe(7);
     });
 });
+
+describe('AstCodeSplitter source coverage', () => {
+    it.each(['ast', 'regex'])('covers imports and top-level statements with %s splitting', async (mode) => {
+        const splitter = new AstCodeSplitter(2000, 0);
+        if (mode === 'regex') {
+            (splitter as unknown as { getParser: () => never }).getParser = () => {
+                throw new Error('forced fallback');
+            };
+        }
+        const lines = [
+            "import { router } from './router';",
+            '',
+            'export function healthCheck() {',
+            '    return "ok";',
+            '}',
+            '',
+            'router.post("/chat", chatHandler);',
+            'app.use(authMiddleware);',
+            '',
+            'export const configured = true;',
+            '',
+            'startServer();',
+        ];
+        const chunks = await splitter.split(lines.join('\n'), 'typescript', '/repo/server.ts');
+
+        for (const [index, line] of lines.entries()) {
+            if (line.trim().length === 0) continue;
+            expect(chunks.some(chunk =>
+                chunk.metadata.startLine <= index + 1
+                && chunk.metadata.endLine >= index + 1
+                && chunk.content.includes(line.trim())
+            )).toBe(true);
+        }
+        expect(chunks.filter(chunk => chunk.metadata.symbolName === 'healthCheck')).toHaveLength(1);
+        const registration = chunks.find(chunk => chunk.content.includes('router.post'));
+        expect(registration?.metadata).toMatchObject({
+            startLine: 7,
+            endLine: 8,
+            chunkKind: 'code',
+            chunkRole: 'reference',
+            isDefinition: false,
+        });
+        expect(chunks.map(chunk => chunk.metadata.startLine)).toEqual(
+            chunks.map(chunk => chunk.metadata.startLine).sort((left, right) => left - right)
+        );
+    });
+
+    it('fills only gaps outside overlapping class and method ranges', async () => {
+        const splitter = new AstCodeSplitter(2000, 0);
+        const code = [
+            "import { connect } from './transport';",
+            '',
+            'export class Service {',
+            '    start() {',
+            '        connect();',
+            '    }',
+            '}',
+            '',
+            'launch();',
+        ].join('\n');
+        const chunks = await splitter.split(code, 'typescript', '/repo/service.ts');
+        const gaps = chunks.filter(chunk => chunk.metadata.chunkKind === 'code');
+
+        expect(gaps.map(chunk => chunk.content)).toEqual([
+            "import { connect } from './transport';",
+            'launch();',
+        ]);
+        expect(gaps.map(chunk => [chunk.metadata.startLine, chunk.metadata.endLine])).toEqual([[1, 1], [9, 9]]);
+    });
+
+    it('refines large uncovered regions without losing source lines', async () => {
+        const splitter = new AstCodeSplitter(80, 0);
+        const lines = [
+            'export function healthCheck() {}',
+            '',
+            ...Array.from({ length: 12 }, (_unused, index) => `router.post("/route-${index}", handler);`),
+        ];
+        const chunks = await splitter.split(lines.join('\n'), 'typescript', '/repo/routes.ts');
+
+        expect(chunks.every(chunk => chunk.content.length <= 80)).toBe(true);
+        for (const [index, line] of lines.entries()) {
+            if (line.trim().length === 0) continue;
+            expect(chunks.some(chunk =>
+                chunk.metadata.startLine <= index + 1
+                && chunk.metadata.endLine >= index + 1
+                && chunk.content.includes(line)
+            )).toBe(true);
+        }
+    });
+});

@@ -200,6 +200,7 @@ function getResumeJournalPaths(codebasePath: string, collectionName: string): { 
 describe('Context indexing lifecycle', () => {
     let tempRoot: string;
     let originalHome: string | undefined;
+    let originalUserProfile: string | undefined;
 
     beforeEach(async () => {
         tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'hitmux-context-engine-indexing-lifecycle-'));
@@ -207,6 +208,8 @@ describe('Context indexing lifecycle', () => {
         await fs.mkdir(homeDir, { recursive: true });
         originalHome = process.env.HOME;
         process.env.HOME = homeDir;
+        originalUserProfile = process.env.USERPROFILE;
+        process.env.USERPROFILE = homeDir;
         await writeConfig(homeDir, { hybridMode: false });
     });
 
@@ -215,6 +218,11 @@ describe('Context indexing lifecycle', () => {
             delete process.env.HOME;
         } else {
             process.env.HOME = originalHome;
+        }
+        if (originalUserProfile === undefined) {
+            delete process.env.USERPROFILE;
+        } else {
+            process.env.USERPROFILE = originalUserProfile;
         }
         await fs.rm(tempRoot, { recursive: true, force: true });
     });
@@ -792,7 +800,7 @@ describe('Context indexing lifecycle', () => {
         expect(vectorDatabase.insert).toHaveBeenCalledWith(
             context.getCollectionName(project),
             expect.any(Array),
-            { deferFlushLoad: true }
+            { deferFlushLoad: true, upsert: true }
         );
         expect(vectorDatabase.finalizeCollectionWrites).toHaveBeenCalledWith(context.getCollectionName(project));
 
@@ -1189,7 +1197,7 @@ describe('Context indexing lifecycle', () => {
         expect(splitter.maxActiveSplits).toBeLessThanOrEqual(2);
     });
 
-    it('skips oversized files before reading them into memory', async () => {
+    it('rejects oversized files before reading them into memory', async () => {
         const project = await createProjectWithFiles(tempRoot, 'oversized-file-project', 1);
         const filePath = path.join(project, 'file-0.ts');
         const vectorDatabase = createVectorDatabase();
@@ -1214,7 +1222,7 @@ describe('Context indexing lifecycle', () => {
         }).processFileList.bind(context);
 
         try {
-            const result = await processFileList(
+            await expect(processFileList(
                 [filePath],
                 project,
                 undefined,
@@ -1223,9 +1231,7 @@ describe('Context indexing lifecycle', () => {
                 undefined,
                 undefined,
                 { knownFileSizes: new Map([[filePath, 129 * 1024 * 1024]]) }
-            );
-
-            expect(result).toMatchObject({ processedFiles: 0, totalChunks: 0 });
+            )).rejects.toThrow('indexing file size limit');
             expect(readFileSpy).not.toHaveBeenCalledWith(filePath, 'utf-8');
             expect(vectorDatabase.insert).not.toHaveBeenCalled();
         } finally {

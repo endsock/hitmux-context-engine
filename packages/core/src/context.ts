@@ -156,6 +156,8 @@ interface InstrumentedVectorDatabase extends VectorDatabase {
 }
 
 interface ProcessFileListOptions {
+    upsert?: boolean;
+    onChunksIndexed?: (chunks: CodeChunk[]) => void;
     deferVectorFlushLoad?: boolean;
     ensureCollectionBeforeInsert?: (dimension: number) => Promise<void>;
     knownFileSizes?: Map<string, number>;
@@ -194,12 +196,8 @@ interface PrepareCollectionResult {
 /**
  * Thrown when the embedding API fails (quota exhausted, auth failure,
  * network error, etc.). Propagates through processFileList so callers
- * can distinguish a critical embedding failure from a per-file skip.
- *
- * Unlike a per-file read/parse error (which is logged and skipped),
- * an EmbeddingError is always re-thrown so that the entire indexing
- * pipeline stops. This prevents silent partial indexing: Milvus would
- * otherwise receive zero vectors while the snapshot marks files as done.
+ * can distinguish provider failures from file read/split failures.
+ * Both stop indexing before a successful snapshot can be committed.
  */
 export class EmbeddingError extends Error {
     constructor(message: string) {
@@ -1198,7 +1196,7 @@ export class Context {
         const fileWeights = await this.getFileProcessingWeights(filesToIndex);
         this.throwIfIndexAborted(options.abortSignal);
         const deletionWeight = 1;
-        const deletionWeightTotal = (removed.length + modified.length) * deletionWeight;
+        const deletionWeightTotal = (removed.length + filesToIndex.length) * deletionWeight;
         const totalWorkWeight = Math.max(deletionWeightTotal + fileWeights.totalWeight, 1);
         let completedWorkWeight = 0;
         let lastProgressPercentage = -1;
@@ -1233,20 +1231,9 @@ export class Context {
             emitProgress(phase, completedWorkWeight);
         };
 
-        for (const file of removed) {
-            this.throwIfIndexAborted(options.abortSignal);
-            await this.deleteFileChunks(collectionName, file);
-            completeDeletionWork(`Removed ${file}`);
-        }
-
-        for (const file of modified) {
-            this.throwIfIndexAborted(options.abortSignal);
-            await this.deleteFileChunks(collectionName, file);
-            completeDeletionWork(`Deleted old chunks for ${file}`);
-        }
-
+        const retainedChunkIds = new Set<string>();
         if (filesToIndex.length > 0) {
-            await this.processFileList(
+            const result = await this.processFileList(
                 filesToIndex,
                 codebasePath,
                 (filePath, fileIndex, totalFiles) => {
@@ -1263,9 +1250,25 @@ export class Context {
                 },
                 undefined,
                 {
-                    deferVectorFlushLoad: true
+                    deferVectorFlushLoad: true,
+                    upsert: true,
+                    onChunksIndexed: (chunks) => {
+                        for (const chunk of chunks) {
+                            retainedChunkIds.add(this.getChunkDocumentIdentity(chunk, codebasePath).id);
+                        }
+                    }
                 }
             );
+            if (result.status !== 'completed') {
+                throw new IndexingVerificationError('Incremental indexing reached the chunk limit. Old chunks and the previous snapshot were retained; reduce the indexed scope before retrying.');
+            }
+        }
+
+        // New writes are finalized before removing old chunks, including leftovers from failed attempts.
+        for (const file of [...removed, ...added, ...modified]) {
+            this.throwIfIndexAborted(options.abortSignal);
+            await this.deleteFileChunks(collectionName, file, retainedChunkIds);
+            completeDeletionWork(`Removed stale chunks for ${file}`);
         }
 
         this.throwIfIndexAborted(options.abortSignal);
@@ -1308,7 +1311,7 @@ export class Context {
         return DEFAULT_AUTOMATIC_INCREMENTAL_EFFECTIVE_LINE_LIMIT;
     }
 
-    private async deleteFileChunks(collectionName: string, relativePath: string): Promise<void> {
+    private async deleteFileChunks(collectionName: string, relativePath: string, retainedIds?: ReadonlySet<string>): Promise<void> {
         const normalizedPath = relativePath.replace(/\\/g, '/');
         const escapedPath = this.escapeFilterString(normalizedPath);
         const results = await this.vectorDatabase.query(
@@ -1318,7 +1321,7 @@ export class Context {
         );
 
         if (results.length > 0) {
-            const ids = results.map(r => r.id as string).filter(id => id);
+            const ids = results.map(r => r.id as string).filter(id => id && !retainedIds?.has(id));
             if (ids.length > 0) {
                 await this.vectorDatabase.delete(collectionName, ids);
                 console.log(`[Context] Deleted ${ids.length} chunks for file ${relativePath}`);
@@ -4623,13 +4626,19 @@ export class Context {
                 deferFlushLoad: options.deferVectorFlushLoad === true,
                 ensureCollectionBeforeInsert: options.ensureCollectionBeforeInsert,
                 abortSignal: signal,
-                ...(options.resumeMode === true ? { upsert: true } : {}),
+                ...(options.upsert === true || options.resumeMode === true ? { upsert: true } : {}),
                 resumeJournal: options.resumeJournal,
                 resumeMode: options.resumeMode,
             }, runCache)
-                .then(() => ({ ok: true as const }))
+                .then(() => {
+                    options.onChunksIndexed?.(batch.map(({ chunk }) => chunk));
+                    return { ok: true as const };
+                })
                 .catch((error) => ({ ok: false as const, error }))
                 .then((result) => {
+                    if (!result.ok) {
+                        firstFatalError = firstFatalError ?? result.error;
+                    }
                     for (const relativePath of batchRelativePathCounts.keys()) {
                         const tracking = getFileCheckpointBatch(relativePath);
                         tracking.pendingBatches--;
@@ -4680,15 +4689,14 @@ export class Context {
             }
         };
 
-        const readAndSplitFile = async (filePath: string): Promise<{ content: string; chunks: CodeChunk[] } | undefined> => {
+        const readAndSplitFile = async (filePath: string): Promise<{ content: string; chunks: CodeChunk[] }> => {
             try {
                 const readSplitStartedAt = this.getMonotonicMs();
                 try {
                     const knownSize = options.knownFileSizes?.get(filePath);
                     const fileSize = knownSize ?? (await fs.promises.stat(filePath)).size;
                     if (fileSize > MAX_INDEX_FILE_BYTES) {
-                        console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${Math.round(fileSize / 1024 / 1024)}MB exceeds the ${Math.round(MAX_INDEX_FILE_BYTES / 1024 / 1024)}MB indexing file size limit`);
-                        return undefined;
+                        throw new Error(`${Math.round(fileSize / 1024 / 1024)}MB exceeds the ${Math.round(MAX_INDEX_FILE_BYTES / 1024 / 1024)}MB indexing file size limit. Exclude this file with .hceignore before retrying.`);
                     }
                     let content = await fs.promises.readFile(filePath, 'utf-8');
                     const extension = path.extname(filePath);
@@ -4710,6 +4718,9 @@ export class Context {
                         codebasePath,
                         filePath
                     );
+                    if (content.trim().length > 0 && chunks.length === 0) {
+                        throw new Error('Splitter returned no chunks for a non-empty file');
+                    }
                     return { content, chunks };
                 } finally {
                     if (timingMetrics) {
@@ -4717,13 +4728,13 @@ export class Context {
                     }
                 }
             } catch (error) {
-                if (error instanceof EmbeddingError
+                const failure = error instanceof EmbeddingError
                     || error instanceof IndexAbortError
-                    || error instanceof FullIndexResumeSourceChangedError) {
-                    throw error;
-                }
-                console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${error}`);
-                return undefined;
+                    || error instanceof FullIndexResumeSourceChangedError
+                    ? error
+                    : new Error(`Failed to index file '${getRelativePath(filePath)}': ${error instanceof Error ? error.message : String(error)}`);
+                firstFatalError = firstFatalError ?? failure;
+                throw failure;
             }
         };
 
@@ -4819,9 +4830,6 @@ export class Context {
                 const filePath = filePaths[fileIndex];
                 const result = await readAndSplitFile(filePath);
                 throwIfStopped();
-                if (!result) {
-                    continue;
-                }
                 await enqueueFileChunks(filePath, fileIndex, result.content, result.chunks);
             }
         };
@@ -4852,6 +4860,9 @@ export class Context {
         }
 
         await waitForAllBatches();
+        if (firstFatalError !== undefined) {
+            throw firstFatalError;
+        }
 
         this.throwIfIndexAborted(signal, processedFiles, filePaths.length);
 

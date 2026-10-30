@@ -153,8 +153,7 @@ export class FileSynchronizer {
         try {
             entries = await fs.readdir(dir, { withFileTypes: true });
         } catch (error: any) {
-            console.warn(`[Synchronizer] Cannot read directory ${dir}: ${error.message}`);
-            return fileHashes;
+            throw new Error(`Cannot read directory ${dir}: ${error.message}`);
         }
         this.currentScanMetrics!.directoriesRead += 1;
 
@@ -172,9 +171,8 @@ export class FileSynchronizer {
             try {
                 stat = await fs.stat(fullPath);
             } catch (error: any) {
-                console.warn(`[Synchronizer] Cannot stat ${fullPath}: ${error.message}`);
                 this.currentScanMetrics!.statErrors += 1;
-                continue;
+                throw new Error(`Cannot stat ${fullPath}: ${error.message}`);
             }
 
             if (stat.isDirectory()) {
@@ -211,9 +209,8 @@ export class FileSynchronizer {
                         fileHashes.set(relativePath, fileState.hash);
                         fileStates.set(relativePath, fileState);
                     } catch (error: any) {
-                        console.warn(`[Synchronizer] Cannot hash file ${fullPath}: ${error.message}`);
                         this.currentScanMetrics!.hashErrors += 1;
-                        continue;
+                        throw new Error(`Cannot hash file ${fullPath}: ${error.message}`);
                     }
                 }
             }
@@ -429,11 +426,12 @@ export class FileSynchronizer {
             return;
         }
 
-        this.fileHashes = this.pendingSnapshotUpdate.fileHashes;
-        this.fileStates = this.pendingSnapshotUpdate.fileStates;
-        this.merkleDAG = this.pendingSnapshotUpdate.merkleDAG;
+        const pending = this.pendingSnapshotUpdate;
+        await this.saveSnapshot(pending);
+        this.fileHashes = pending.fileHashes;
+        this.fileStates = pending.fileStates;
+        this.merkleDAG = pending.merkleDAG;
         this.pendingSnapshotUpdate = null;
-        await this.saveSnapshot();
     }
 
     public discardPendingChanges(): void {
@@ -616,32 +614,43 @@ export class FileSynchronizer {
         return this.fileHashes.size;
     }
 
-    private async saveSnapshot(): Promise<void> {
+    private async saveSnapshot(snapshot = {
+        fileHashes: this.fileHashes,
+        fileStates: this.fileStates,
+        merkleDAG: this.merkleDAG
+    }): Promise<void> {
         const merkleDir = path.dirname(this.snapshotPath);
         await fs.mkdir(merkleDir, { recursive: true });
 
         // Convert Map to array without using iterator
         const fileHashesArray: [string, string][] = [];
-        const keys = Array.from(this.fileHashes.keys());
+        const keys = Array.from(snapshot.fileHashes.keys());
         keys.forEach(key => {
-            fileHashesArray.push([key, this.fileHashes.get(key)!]);
+            fileHashesArray.push([key, snapshot.fileHashes.get(key)!]);
         });
-        const fileStatesArray = Array.from(this.fileStates.entries());
+        const fileStatesArray = Array.from(snapshot.fileStates.entries());
 
-        this.assertSnapshotSizeWithinLimit(fileHashesArray);
+        this.assertSnapshotSizeWithinLimit(fileHashesArray, snapshot.merkleDAG);
 
         const data = JSON.stringify({
             fileHashes: fileHashesArray,
             fileStates: fileStatesArray,
-            merkleDAG: this.merkleDAG.serialize()
+            merkleDAG: snapshot.merkleDAG.serialize()
         });
-        await fs.writeFile(this.snapshotPath, data, 'utf-8');
+        const tempPath = `${this.snapshotPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        try {
+            await fs.writeFile(tempPath, data, 'utf-8');
+            await fs.rename(tempPath, this.snapshotPath);
+        } catch (error) {
+            await fs.rm(tempPath, { force: true }).catch(() => undefined);
+            throw error;
+        }
         console.log(`Saved snapshot to ${this.snapshotPath}`);
     }
 
-    private assertSnapshotSizeWithinLimit(fileHashesArray: [string, string][]): void {
+    private assertSnapshotSizeWithinLimit(fileHashesArray: [string, string][], merkleDAG = this.merkleDAG): void {
         const maxBytes = this.getMaxSnapshotBytes();
-        const estimatedBytes = this.estimateSnapshotBytes(fileHashesArray);
+        const estimatedBytes = this.estimateSnapshotBytes(fileHashesArray, merkleDAG);
 
         if (estimatedBytes > maxBytes) {
             throw new SnapshotTooLargeError(
@@ -675,14 +684,14 @@ export class FileSynchronizer {
         return os.homedir();
     }
 
-    private estimateSnapshotBytes(fileHashesArray: [string, string][]): number {
+    private estimateSnapshotBytes(fileHashesArray: [string, string][], merkleDAG = this.merkleDAG): number {
         let bytes = 64;
 
         for (const [filePath, hash] of fileHashesArray) {
             bytes += Buffer.byteLength(filePath, 'utf-8') + Buffer.byteLength(hash, 'utf-8') + 12;
         }
 
-        for (const node of this.merkleDAG.getAllNodes()) {
+        for (const node of merkleDAG.getAllNodes()) {
             bytes += Buffer.byteLength(node.id, 'utf-8') * 2;
             bytes += Buffer.byteLength(node.data, 'utf-8');
             bytes += node.parents.length * 72;
