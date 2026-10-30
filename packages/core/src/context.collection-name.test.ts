@@ -78,7 +78,7 @@ describe('codebase identity path normalization', () => {
             fs.mkdirSync(path.join(secondRepo, '.git'), { recursive: true });
             const config = [
                 '[remote "origin"]',
-                '    url = git@github.com:hitmux/hitmux-context-engine.git',
+                '    url = git@github.com:endsock/hitmux-context-engine.git',
                 ''
             ].join('\n');
             fs.writeFileSync(path.join(firstRepo, '.git', 'config'), config);

@@ -359,7 +359,7 @@ describe('Context lexical search supplement', () => {
             Authorization: 'Bearer sk-or-test',
             'Content-Type': 'application/json',
             'X-Hitmux-Client': 'Hitmux Context Engine',
-            'HTTP-Referer': 'https://github.com/hitmux/hitmux-context-engine',
+            'HTTP-Referer': 'https://github.com/endsock/hitmux-context-engine',
             'X-OpenRouter-Title': 'Hitmux Context Engine',
         }));
         const body = JSON.parse(String(request.body));

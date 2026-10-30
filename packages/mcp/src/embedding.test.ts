@@ -20,7 +20,7 @@ test("OpenRouter embedding declares app attribution headers", () => {
 
     assert.deepEqual(client._options?.defaultHeaders, {
         "X-Hitmux-Client": "Hitmux Context Engine",
-        "HTTP-Referer": "https://github.com/hitmux/hitmux-context-engine",
+        "HTTP-Referer": "https://github.com/endsock/hitmux-context-engine",
         "X-OpenRouter-Title": "Hitmux Context Engine",
     });
 });

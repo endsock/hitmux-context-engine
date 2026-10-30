@@ -25,7 +25,7 @@ describe('OpenAIEmbedding', () => {
             model: 'text-embedding-3-small',
             baseURL: 'https://provider.example/v1',
             defaultHeaders: {
-                'HTTP-Referer': 'https://github.com/hitmux/hitmux-context-engine',
+                'HTTP-Referer': 'https://github.com/endsock/hitmux-context-engine',
                 'X-OpenRouter-Title': 'Hitmux Context Engine',
             },
         });
@@ -34,7 +34,7 @@ describe('OpenAIEmbedding', () => {
             apiKey: 'test-api-key',
             baseURL: 'https://provider.example/v1',
             defaultHeaders: {
-                'HTTP-Referer': 'https://github.com/hitmux/hitmux-context-engine',
+                'HTTP-Referer': 'https://github.com/endsock/hitmux-context-engine',
                 'X-OpenRouter-Title': 'Hitmux Context Engine',
             },
         });

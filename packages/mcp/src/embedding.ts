@@ -20,7 +20,7 @@ const HITMUX_CLIENT_HEADERS = {
 
 const OPENROUTER_APP_ATTRIBUTION_HEADERS = {
     ...HITMUX_CLIENT_HEADERS,
-    "HTTP-Referer": "https://github.com/hitmux/hitmux-context-engine",
+    "HTTP-Referer": "https://github.com/endsock/hitmux-context-engine",
     "X-OpenRouter-Title": "Hitmux Context Engine",
 } as const;
 
